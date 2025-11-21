@@ -5,9 +5,9 @@ open X86
 
 (* Overview ----------------------------------------------------------------- *)
 
-(* We suggest that you spend some time understinging this entire file and 
+(* We suggest that you spend some time understanding this entire file and
    how it fits with the compiler pipeline before making changes.  The suggested
-   plan for implementing the compiler is provided on the project web page. 
+   plan for implementing the compiler is provided on the project web page.
 *)
 
 
@@ -44,15 +44,14 @@ let rbp_offset (offset:int) : X86.operand =
    the stack).  Since LLVMlite, unlike real LLVM, permits %uid locals
    to store only 64-bit data, each stack slot is an 8-byte value.
 
-   [ NOTE: For compiling LLVMlite, even i1 data values should be
-   represented as a 8-byte quad. This greatly simplifies code
-   generation. ]
+   [ NOTE: For compiling LLVMlite, even i1 data values should be represented
+   in 64 bit. This greatly simplifies code generation. ]
 
    We call the datastructure that maps each %uid to its stack slot a
    'stack layout'.  A stack layout maps a uid to an X86 operand for
    accessing its contents.  For this compilation strategy, the operand
    is always an offset from %rbp (in bytes) that represents a storage slot in
-   the stack.  
+   the stack.
 *)
 
 type layout = (uid * X86.operand) list
@@ -77,7 +76,7 @@ let lookup m x = List.assoc x m
 
      NOTE: two important facts about global identifiers:
 
-     (1) You should use (Platform.mangle gid) to obtain a string 
+     (1) You should use (Platform.mangle gid) to obtain a string
      suitable for naming a global label on your platform (OS X expects
      "_main" while linux expects "main").
 
@@ -92,19 +91,20 @@ let lookup m x = List.assoc x m
    manipulated by the LLVM IR instruction. You might find it useful to
    implement the following helper function, whose job is to generate
    the X86 instruction that moves an LLVM operand into a designated
-   destination (usually a register).  
+   destination (usually a register).
 *)
-let compile_operand ctxt dest : Ll.operand -> ins =
-  function
+let compile_operand (ctxt:ctxt) (dest:X86.operand) : Ll.operand -> ins =
+function
   | Null     -> Asm.(Movq, [~$0; dest])
   | Const i  -> Asm.(Movq, [Imm (Lit i); dest])
   | Gid id   -> Asm.(Leaq, [Ind3 (Lbl (Platform.mangle id), Rip); dest])
   | Id id    -> Asm.(Movq, [lookup ctxt.layout id; dest])
 
 
+
 (* compiling call  ---------------------------------------------------------- *)
 
-(* You will probably find it helpful to implement a helper function that 
+(* You will probably find it helpful to implement a helper function that
    generates code for the LLVM IR call instruction.
 
    The code you generate should follow the x64 System V AMD64 ABI
@@ -121,7 +121,6 @@ let compile_operand ctxt dest : Ll.operand -> ins =
    [ NOTE: Don't forget to preserve caller-save registers (only if
    needed). ]
 *)
-
 
 let arg_reg : int -> (X86.operand) option = function
   | 0 -> Some (Reg Rdi)
@@ -151,10 +150,14 @@ let compile_call ctxt fop args =
     in register_arg_code @ stack_arg_code
   in
 
-  arg_code @ call_code @
-  (X86.Callq, [op])  ::
+  let stack_alignment_offset = if ((List.length args) > 6) && ((List.length args) mod 2 = 1) then 1 else 0 in
+  let stack_alignment_pre = if (stack_alignment_offset == 1) then Asm.([Subq, [(imm_of_int 8); ~%Rsp]]) else [] in
+  let align_stack_prologue = Asm.([Andq, [(imm_of_int (-16)); ~%Rsp]]) @ stack_alignment_pre in
+
+  align_stack_prologue @ arg_code @ call_code @
+  [X86.Callq, [op]] @
   (if (List.length args) > 6 then
-     Asm.([Addq, [imm_of_int (8 * ((List.length args) - 6)); ~%Rsp]])
+     Asm.([Addq, [imm_of_int (8 * (((List.length args) - 6) + stack_alignment_offset)); ~%Rsp]])
    else [])
 
 (* compiling getelementptr (gep)  ------------------------------------------- *)
@@ -164,11 +167,11 @@ let compile_call ctxt fop args =
    address based on the size of the data, which is dictated by the
    data's type.
 
-   To compile getelmentptr, you must generate x86 code that performs
-   the appropriate arithemetic calculations.
+   To compile getelementptr, you must generate x86 code that performs
+   the appropriate arithmetic calculations.
 *)
 
-(* [size_ty] maps an LLVMlite type to a size in bytes. 
+(* [size_ty] maps an LLVMlite type to a size in bytes.
     (needed for getelementptr)
 
    - the size of a struct is the sum of the sizes of each component
@@ -199,8 +202,14 @@ let index_into tdecls (ts:ty list) (n:int) : int * ty =
     end
   in loop ts n 0
 
+(* Puts the address computed by a gep computation into %rax. On 64-bit x86, the
+   getelementptr instruction supports only i64 indices. Moreover, the first
+   index must be exactly 0l. Subsequent indices are interpreted as offsets whose
+   size is determined by the type of the op pointer.
 
-(* Generates code that computes a pointer value.  
+   LLVM allows non-constant indices only into arrays, whose element sizes are
+   known statically *)
+(* Generates code that computes a pointer value.
 
    1. op must be of pointer type: t*
 
@@ -211,14 +220,14 @@ let index_into tdecls (ts:ty list) (n:int) : int * ty =
 
    4. subsequent indices are interpreted according to the type t:
 
-     - if t is a struct, the index must be a constant n and it 
+     - if t is a struct, the index must be a constant n and it
        picks out the n'th element of the struct. [ NOTE: the offset
-       within the struct of the n'th element is determined by the 
+       within the struct of the n'th element is determined by the
        sizes of the types of the previous elements ]
 
      - if t is an array, the index can be any operand, and its
        value determines the offset within the array.
- 
+
      - if t is any other type, the path is invalid
 
    5. if the index is valid, the remainder of the path is computed as
@@ -257,6 +266,7 @@ let compile_gep (ctxt:ctxt) (op : Ll.ty * Ll.operand) (path: Ll.operand list) : 
   | _ -> failwith "compile_gep got incorrect parameters"
 
 
+
 (* compiling instructions  -------------------------------------------------- *)
 
 (* The result of compiling a single LLVM instruction might be many x86
@@ -281,15 +291,15 @@ let compile_gep (ctxt:ctxt) (op : Ll.ty * Ll.operand) (path: Ll.operand list) : 
    - Bitcast: does nothing interesting at the assembly level
 *)
 let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
-  let op_to = compile_operand ctxt in 
+  let op_to = compile_operand ctxt in
   let op_to_rax = op_to (Reg Rax) in (* Move the value of op into rax *)
   let op_to_rcx = op_to (Reg Rcx) in (* Move the value of op into rax *)
   let dst = lookup ctxt.layout uid in
   match i with
   | Binop (bop, t, op1, op2) ->
-    let bin op = 
-      (op_to_rax op1) :: 
-      (op_to_rcx op2) :: 
+    let bin op =
+      (op_to_rax op1) ::
+      (op_to_rcx op2) ::
       Asm.([ op, [~%Rcx; ~%Rax]
           ; Movq, [~%Rax; dst] ])
     in
@@ -305,7 +315,7 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
      | Ll.Xor ->  bin Xorq
     end
 
-  (* Alloca instructions allocate an fresh stack slot and 
+  (* Alloca instructions allocate an fresh stack slot and
      move the address of the newly allocated storage into the
      destination uid.   *)
   | Alloca (_t) -> Asm.([ Pushq, [~$0]
@@ -347,9 +357,10 @@ let compile_insn (ctxt:ctxt) ((uid:uid), (i:Ll.insn)) : X86.ins list =
     code @ Asm.([ Movq, [~%Rax; dst] ])
 
 
+
 (* compiling terminators  --------------------------------------------------- *)
 
-(* prefix the function name [fn] to a label to ensure that the X86 labels are 
+(* prefix the function name [fn] to a label to ensure that the X86 labels are
    globally unique . *)
 let mk_lbl (fn:string) (l:string) = fn ^ "." ^ l
 
@@ -362,6 +373,8 @@ let mk_lbl (fn:string) (l:string) = fn ^ "." ^ l
    - Br should jump
 
    - Cbr branch should treat its operand as a boolean conditional
+
+   [fn] - the name of the function containing this terminator
 *)
 let compile_terminator (fn:string) (ctxt:ctxt) (t:Ll.terminator) : ins list =
   let epilogue = Asm.([ Movq, [~%Rbp; ~%Rsp]
@@ -379,6 +392,11 @@ let compile_terminator (fn:string) (ctxt:ctxt) (t:Ll.terminator) : ins list =
 
 (* compiling blocks --------------------------------------------------------- *)
 
+(* We have left this helper function here for you to complete.
+   [fn] - the name of the function containing this block
+   [ctxt] - the current context
+   [blk]  - LLVM IR code for the block
+*)
 let compile_block (fn:string) (ctxt:ctxt) (blk:Ll.block) : ins list =
   let insns = List.map (compile_insn ctxt) blk.insns |> List.flatten in
   let term = compile_terminator fn ctxt (snd blk.term) in
@@ -405,13 +423,14 @@ let arg_loc (n : int) : operand =
     | None -> rbp_offset (n-4)
   end
 
-(* We suggest that you create a helper function that computes the 
+
+(* We suggest that you create a helper function that computes the
    stack layout for a given function declaration.
 
    - each function argument should be copied into a stack slot
-   - in this (inefficient) compilation strategy, each local id 
+   - in this (inefficient) compilation strategy, each local id
      is also stored as a stack slot.
-   - see the discussion about locals 
+   - see the discussion about locals
 
 *)
 let stack_layout (args : uid list) ((block, lbled_blocks):cfg) : layout =
