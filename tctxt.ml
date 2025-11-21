@@ -25,6 +25,8 @@ let lookup_local_option id c : Ast.ty option =
 
 (* globals ------------------------------------------------------------------ *)
 let add_global (c:t) (id:id) (bnd:Ast.ty) : t = {c with globals = (id, bnd)::c.globals}
+let add_globals (c:t) (lst:(Ast.id * Ast.ty) list) : t =
+  {c with globals = lst @ c.globals}
 let lookup_global (id : Ast.id) (c : t) : Ast.ty = List.assoc id c.globals
 let lookup_global_option id c : Ast.ty option =
   try Some (List.assoc id c.globals) with Not_found -> None

@@ -2,7 +2,6 @@
 type 'a node = { elt : 'a; loc : Range.t }
 
 (** val no_loc : 'a1 -> 'a1 node **)
-
 let no_loc x =
   { elt = x; loc = Range.norange }
 

@@ -11,6 +11,8 @@ let type_error (l : 'a node) err =
   let (_, (s, e), _) = l.loc in
   raise (TypeError (Printf.sprintf "[%d, %d] %s" s e err))
 
+let und (l: 'a list) : bool = not @@ List.mem false l
+
 
 (* initial context: G0 ------------------------------------------------------ *)
 (* The Oat types of the Oat built-in functions *)
@@ -51,15 +53,40 @@ let rec subtype (c : Tctxt.t) (t1 : Ast.ty) (t2 : Ast.ty) : bool =
     match t1,t2 with
     | TNullRef rt1, TNullRef rt2 -> subtype_ref c rt1 rt2
     | TRef rt1, TRef rt2 -> subtype_ref c rt1 rt2
-    | TRef rt1, TNullRef rt2 -> subtype_ref c rt1 (TRef rt2)
+    | TRef rt1, TNullRef rt2 -> subtype_ref c rt1 rt2
     | _ -> false
 
 (* Decides whether H |-r ref1 <: ref2 *)
-and subtype_ref (c : Tctxt.t) (t1 : Ast.rty) (t2 : Ast.rty) : bool =
-  failwith "todo: subtype_ref"
+and subtype_ref (c : Tctxt.t) (t1 : Ast.rty) (t2 : Ast.rty) : bool = match t1,t2 with
+  | RString, RString -> true
+  | RArray arr_t1, RArray arr_t2 -> arr_t1=arr_t2
+  | RStruct s1, RStruct s2 ->
+    let s1_struct_ty= lookup_struct_option s1 c
+    and s2_struct_ty= lookup_struct_option s2 c in
+    let rec isPrefix l1 l2 =
+      match l1,l2 with
+      | [], _ -> true
+      | _, [] -> false
+      | h1::t1, h2::t2 -> if h1=h2 then isPrefix t1 t2 else false in
+    begin match s1_struct_ty,s2_struct_ty with
+      |None, _ | _, None -> false
+      | Some field_list_s1, Some field_list_s2 ->
+        isPrefix field_list_s2 field_list_s1
+        (*not @@ List.mem false @@ List.map (fun x -> List.mem x field_list_s1) field_list_s2*)
+    end
+  | (RFun (args_t1,rty_t1)),(RFun (args_t2, rty_t2)) ->
+    List.length args_t1 = List.length args_t2 &&
+    not @@ List.mem false @@ List.map2 (subtype c) args_t2 args_t1 &&
+    subtype_retty c rty_t1 rty_t2
+
+
+  | _ -> false
+
 (*decides wherether H |- rt1 <: rt2 *)
-and subtype_rt (c : Tctxt.t) (rt1 : Ast.rty) (rt2 : Ast.rty) : bool =
-  failwith "todo: subtype_rt"
+and subtype_retty (c : Tctxt.t) (rt1 : Ast.ret_ty) (rt2 : Ast.ret_ty) : bool = match rt1,rt2 with
+  | RetVoid, RetVoid -> true
+  | RetVal t1, RetVal t2 -> subtype c t1 t2
+  | _ -> false
 
 
 (* well-formed types -------------------------------------------------------- *)
@@ -77,8 +104,22 @@ and subtype_rt (c : Tctxt.t) (rt1 : Ast.rty) (rt2 : Ast.rty) : bool =
 
     - tc contains the structure definition context
  *)
-let rec typecheck_ty (l : 'a Ast.node) (tc : Tctxt.t) (t : Ast.ty) : unit =
-  failwith "todo: implement typecheck_ty"
+let rec typecheck_ty (l : 'a Ast.node) (tc : Tctxt.t) (t : Ast.ty) : unit = match t with
+  | TInt | TBool-> ()
+  | TRef r | TNullRef r -> typecheck_refty l tc r
+
+and typecheck_refty (l : 'a Ast.node) (tc : Tctxt.t) (t : Ast.rty) : unit = match t with
+  | RString -> ()
+  | RArray t_arr ->typecheck_ty l tc t_arr
+  | RStruct struct_id -> let struct_ty = lookup_struct_option struct_id tc in
+    begin match struct_ty with
+    | None -> type_error l ("Undefined struct type: " ^ struct_id)
+    | Some _ -> ()
+    end
+| RFun (args, ret_ty) -> typecheck_returnty l tc ret_ty ; List.iter (typecheck_ty l tc) args
+and typecheck_returnty (l : 'a Ast.node) (tc : Tctxt.t) (t : Ast.ret_ty) : unit = match t with
+  | RetVoid -> ()
+  | RetVal ty -> typecheck_ty l tc ty
 
 (* typechecking expressions ------------------------------------------------- *)
 (* Typechecks an expression in the typing context c, returns the type of the
@@ -105,8 +146,89 @@ let rec typecheck_ty (l : 'a Ast.node) (tc : Tctxt.t) (t : Ast.ty) : unit =
    a=1} is well typed.  (You should sort the fields to compare them.)
 
 *)
-let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
-  failwith "todo: implement typecheck_exp"
+let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty = match e.elt with
+  | CNull ref_ty -> TNullRef ref_ty
+  | CBool _ -> TBool
+  | CInt _ -> TInt
+  | CStr _ -> TRef RString
+  | Id name when List.mem name (List.map fst c.locals) -> lookup_local name c
+  | Id name -> (try lookup_global name c with Not_found -> type_error e ("no type is known for identifier " ^ name))
+  | CArr (arr_ty,init_list) ->
+    let all_initializers_match_type =und @@ List.map (fun x -> subtype c (typecheck_exp c x) arr_ty) init_list in
+    if typecheck_ty e c arr_ty;all_initializers_match_type then TRef (RArray arr_ty) else type_error e ("Mismatch in initalizers for array")
+  | NewArr (arr_ty,size_node,x, exp_2) ->
+    let arr_type_valid = (typecheck_ty e c arr_ty=()) in
+    let arr_size_is_int = (typecheck_exp c size_node = TInt) in
+    let x_is_free = match lookup_local_option x c with
+      | None -> true
+      | Some _ -> false in
+    let expanded_context = add_local c x TInt in
+    let exp2_type = typecheck_exp expanded_context exp_2 in
+    let exp2_type_is_subtype = subtype c exp2_type arr_ty in
+    if arr_type_valid && arr_size_is_int && x_is_free && exp2_type_is_subtype
+    then TRef (RArray arr_ty)
+    else type_error e ("Ill-typed lambda array creation")
+  | Index (array, index) ->
+  let type_of_array = match typecheck_exp c array with
+    | TRef (RArray t) -> t
+    | TNullRef (RArray t) -> t
+    | _ -> type_error e ("Indexing non-array type") in
+  let index_is_int = (typecheck_exp c index = TInt) in
+  if index_is_int then type_of_array else type_error e ("Index is not an integer")
+  | Length arr ->
+    begin match typecheck_exp c arr with
+    | TRef (RArray _) -> TInt
+    | TNullRef (RArray _) -> TInt
+    | _ -> type_error e ("Length applied to non-array type")
+    end
+  | CStruct (struct_typename ,assignment_list) ->
+  let expected_struct_fields = match lookup_struct_option struct_typename c with
+    | None -> type_error e ("Undefined struct type: " ^ struct_typename)
+    | Some fields -> List.map (fun f -> (f.fieldName, f.ftyp)) fields in
+  let sorted_expected_struct_fields = List.sort (fun (name1, _) (name2, _) -> String.compare name1 name2) expected_struct_fields in
+  let struct_fields = List.map (fun (name, exp) -> (name, typecheck_exp c exp)) assignment_list in
+  let sorted_struct_fields = List.sort (fun (name1, _) (name2, _) -> String.compare name1 name2) struct_fields in
+  let is_subtype_list = List.map2 (fun actual expected -> subtype c (snd actual) (snd expected)) sorted_struct_fields sorted_expected_struct_fields in
+  if und is_subtype_list then TRef (RStruct struct_typename) else type_error e ("Struct field types do not match")
+  | Proj (struct_exp, field_name) ->
+  let struct_type = match typecheck_exp c struct_exp with
+    | TRef (RStruct s) -> s
+    | TNullRef (RStruct s) -> s
+    | _ -> type_error e ("Projection from non-struct type") in
+  begin match lookup_field_option struct_type field_name c with
+    | None -> type_error e ("Field " ^ field_name ^ " not found in struct " ^ struct_type)
+    | Some t -> t
+  end
+  | Call (fn_exp, arg_exps) ->
+  let fn_name =begin match fn_exp.elt with
+    | Id name -> name
+    | _ -> type_error e ("Function call on non-identifier")
+  end in
+  let fn_type = try lookup fn_name c with Not_found -> type_error e ("No type known for function " ^ fn_name) in
+  let arg_types = List.map (typecheck_exp c) arg_exps in
+  begin match fn_type with
+    | TRef (RFun (param_types, ret_ty)) | TNullRef (RFun (param_types, ret_ty)) ->
+    begin match ret_ty with
+      | RetVoid -> type_error e ("Function " ^ fn_name ^ " has void return type, cannot be used in expression")
+      | RetVal ret_type ->
+        if und @@ List.map2 (subtype c) arg_types param_types
+        then ret_type
+        else type_error e ("Argument types do not match for function " ^ fn_name)
+    end
+    | _ -> type_error e ("Function call on non-function type for " ^ fn_name)
+  end
+  | Bop (Eq, a, b) | Bop (Neq, a,b) ->
+    let a_type,b_type = typecheck_exp c a, typecheck_exp c b in
+    if subtype c a_type b_type && subtype c b_type a_type then TBool else type_error e ("Equality operator type mismatch")
+  | Bop (op, a, b) ->
+    let (x,y,z) = typ_of_binop op in
+    let a_type,b_type = typecheck_exp c a, typecheck_exp c b in
+    if a_type= x && b_type = y then z else type_error e ("Binary operator type mismatch")
+  | Uop (op, a) ->
+    let (x,y) = typ_of_unop op in
+    let a_type = typecheck_exp c a in
+    if a_type = x then y else type_error e ("Unary operator type mismatch")
+  | _ -> failwith "todo: implement remaining expression cases"
 
 (* statements --------------------------------------------------------------- *)
 
@@ -199,13 +321,43 @@ let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
    constants, but can't mention other global values *)
 
 let create_struct_ctxt (p:Ast.prog) : Tctxt.t =
-  failwith "todo: create_struct_ctxt"
-
+  let unwrap x = match x with
+    | Gtdecl n -> n.elt
+    | _ -> failwith "unwrap: not a type declaration" in
+  let is_type_decl p =
+    match p with
+    | Gtdecl _ -> true
+    | _ -> false in
+  let decls = List.map unwrap @@ List.filter is_type_decl p in
+  {
+    locals = [];
+    globals = [];
+    structs = decls;
+  }
 let create_function_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
-  failwith "todo: create_function_ctxt"
-
+  let unwrap x = match x with
+    | Gfdecl n -> n.elt
+    | _ -> failwith "unwrap: not a function declaration" in
+  let is_function_decl p =
+    match p with
+    | Gfdecl _ -> true
+    | _ -> false in
+  let decls = List.map unwrap @@ List.filter is_function_decl p in
+  let typ_of_fdecl (f:fdecl) : (id*ty)=
+    let arg_types = List.map fst f.args in
+    (f.fname,TRef (RFun (arg_types,f.frtyp))) in
+  add_globals tc (List.map typ_of_fdecl decls)
 let create_global_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
-  failwith "todo: create_function_ctxt"
+  let is_vdecl p =
+    match p with
+    | Gvdecl _ -> true
+    | _ -> false in
+ let vdecls = List.map (fun x -> match x with
+    | Gvdecl n -> n.elt
+    | _ -> failwith "unwrap: not a global variable declaration") @@ List.filter is_vdecl p in
+  let typ_of_gdecl (g:gdecl) : (id*ty) =
+    (g.name, typecheck_exp tc g.init) in
+  add_globals tc (List.map typ_of_gdecl vdecls)
 
 
 (* This function implements the |- prog and the H ; G |- prog
