@@ -13,6 +13,15 @@ let type_error (l : 'a node) err =
 
 let all_true (l : bool list) : bool = List.for_all (fun x -> x) l
 
+let has_duplicates lst =
+  let rec aux = function
+    | [] -> false
+    | x :: xs -> List.mem x xs || aux xs
+  in
+  aux lst
+
+let flip (p:'a * 'b) = let (x,y) = p in (y,x)
+
 
 (* initial context: G0 ------------------------------------------------------ *)
 (* The Oat types of the Oat built-in functions *)
@@ -167,29 +176,37 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty = match e.elt wi
   | Index (array, index) ->
   let type_of_array = match typecheck_exp c array with
     | TRef (RArray t) -> t
-    | TNullRef (RArray t) -> t
+    | TNullRef (RArray t) -> type_error e ("Cannot index into nullable array reference")
     | _ -> type_error e ("Indexing non-array type") in
   let index_is_int = (typecheck_exp c index = TInt) in
   if index_is_int then type_of_array else type_error e ("Index is not an integer")
   | Length arr ->
     begin match typecheck_exp c arr with
     | TRef (RArray _) -> TInt
-    | TNullRef (RArray _) -> TInt
+    | TNullRef (RArray _) -> type_error e ("Cannot get length of nullable array reference")
     | _ -> type_error e ("Length applied to non-array type")
     end
   | CStruct (struct_typename ,assignment_list) ->
   let expected_struct_fields = match lookup_struct_option struct_typename c with
     | None -> type_error e ("Undefined struct type: " ^ struct_typename)
     | Some fields -> List.map (fun f -> (f.fieldName, f.ftyp)) fields in
+  let assigned_names = List.map fst assignment_list in
+  if has_duplicates assigned_names then type_error e "Duplicate fields in struct initialization";
   let sorted_expected_struct_fields = List.sort (fun (name1, _) (name2, _) -> String.compare name1 name2) expected_struct_fields in
   let struct_fields = List.map (fun (name, exp) -> (name, typecheck_exp c exp)) assignment_list in
   let sorted_struct_fields = List.sort (fun (name1, _) (name2, _) -> String.compare name1 name2) struct_fields in
-  let is_subtype_list = List.map2 (fun actual expected -> subtype c (snd actual) (snd expected)) sorted_struct_fields sorted_expected_struct_fields in
+  if List.length sorted_struct_fields <> List.length sorted_expected_struct_fields then
+     type_error e "Struct field count mismatch";
+  let check_field (actual_name, actual_ty) (expected_name, expected_ty) =
+     if actual_name <> expected_name then type_error e ("Field mismatch: expected " ^ expected_name ^ ", got " ^ actual_name);
+     subtype c actual_ty expected_ty
+  in
+  let is_subtype_list = List.map2 check_field sorted_struct_fields sorted_expected_struct_fields in
   if all_true is_subtype_list then TRef (RStruct struct_typename) else type_error e ("Struct field types do not match")
   | Proj (struct_exp, field_name) ->
   let struct_type = match typecheck_exp c struct_exp with
     | TRef (RStruct s) -> s
-    | TNullRef (RStruct s) -> s
+    | TNullRef (RStruct s) -> type_error e ("Cannot project field from nullable struct reference")
     | _ -> type_error e ("Projection from non-struct type") in
   begin match lookup_field_option struct_type field_name c with
     | None -> type_error e ("Field " ^ field_name ^ " not found in struct " ^ struct_type)
@@ -258,27 +275,17 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty = match e.elt wi
      block typecheck rules.
 *)
 
-let has_duplicates lst =
-  let rec aux = function
-    | [] -> false
-    | x :: xs -> List.mem x xs || aux xs
-  in
-  aux lst
-
-let flip (p:'a * 'b) = let (x,y) = p in (y,x)
 
 (* Helper function to check if a block returns without throwing an error *)
 let rec block_returns (tc : Tctxt.t) (b : Ast.block) (to_ret : Ast.ret_ty) : bool =
   let fold_function (acc: Tctxt.t * bool) (n:stmt node) =
     let new_ctxt,returns = typecheck_stmt (fst acc) n to_ret in
+    if (snd acc) && returns then type_error n "Unreachable statement after definite return";
     (new_ctxt, (snd acc) || returns) in
   snd @@ List.fold_left fold_function (tc, false) b
 
 and typecheck_block (tc : Tctxt.t) (b : Ast.block) (to_ret : Ast.ret_ty) : unit =
-  let fold_function (acc: Tctxt.t * bool) (n:stmt node) =
-    let new_ctxt,returns = typecheck_stmt (fst acc) n to_ret in
-    (new_ctxt, (snd acc) || returns) in
-  if snd @@ List.fold_left fold_function (tc, false) b then ()
+  if block_returns tc b to_ret then ()
   else type_error (List.hd b) "Function body does not definitely return"
 and  typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.t * bool = match s.elt with
   | Decl (id ,exp_node) -> let exp_ty = typecheck_exp tc exp_node in
@@ -348,7 +355,7 @@ and  typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.t *
     if typecheck_exp tc cond <> TBool then
       type_error s "Condition expression not boolean in while statement"
     else
-      typecheck_block tc block to_ret;
+      ignore (block_returns tc block to_ret);
       (tc, false)
   |For (vdecls,Some cond,Some stmt, block) ->
   let vdecls_stmts = List.map (fun vd -> {elt=Decl vd; loc=s.loc}) vdecls in
@@ -359,10 +366,15 @@ and  typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.t *
   if typecheck_exp expanded_context cond <> TBool then
     type_error s "Condition expression not boolean in for statement"
   else
+    (match stmt.elt with
+    | Assn _ | SCall _ -> ()
+    | _ -> type_error s "For loop update must be assignment or function call");
     let _,_ = typecheck_stmt expanded_context stmt to_ret in
-    typecheck_block expanded_context block to_ret;
+    ignore (block_returns expanded_context block to_ret);
     (tc, false)
-  | Ret None -> (tc,true)
+  | Ret None -> 
+    if to_ret <> RetVoid then type_error s "Return type mismatch: expected non-void return";
+    (tc,true)
   | Ret (Some expr) ->
   let return_ty= match to_ret with
     | RetVoid -> type_error s "Return type mismatch: expected void"
@@ -397,8 +409,15 @@ let typecheck_tdecl (tc : Tctxt.t) id fs  (l : 'a Ast.node) : unit =
     - checks that the function actually returns
 *)
 let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
+  (* Validate parameter types are well-formed *)
+  List.iter (fun (param_ty, _) -> typecheck_ty l tc param_ty) f.args;
+  (* Validate return type is well-formed *)
+  typecheck_returnty l tc f.frtyp;
+  (* Check for duplicate parameter names *)
+  if has_duplicates @@ List.map snd f.args then
+    raise (TypeError ("Duplicate parameter names in function " ^ f.fname));
+  (* Typecheck the function body *)
   let expanded_context = add_locals tc (List.map flip f.args) in
-  if has_duplicates @@ List.map snd f.args then raise (TypeError ("Duplicate parameter names in function " ^ f.fname)) else
   typecheck_block expanded_context f.body f.frtyp
 
 (* creating the typchecking context ----------------------------------------- *)
@@ -437,9 +456,12 @@ let create_struct_ctxt (p:Ast.prog) : Tctxt.t =
     | Gtdecl _ -> true
     | _ -> false in
   let decls = List.map unwrap @@ List.filter is_type_decl p in
+  if has_duplicates (List.map fst decls) then raise (TypeError "Duplicate struct names");
+  let builtin_globals = List.map (fun (name, (args, ret)) ->
+    (name, TRef (RFun (args, ret)))) builtins in
   {
     locals = [];
-    globals = [];
+    globals = builtin_globals;
     structs = decls;
   }
 let create_function_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
@@ -451,6 +473,9 @@ let create_function_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
     | Gfdecl _ -> true
     | _ -> false in
   let decls = List.map unwrap @@ List.filter is_function_decl p in
+  let func_names = List.map (fun f -> f.fname) decls in
+  if has_duplicates func_names then raise (TypeError "Duplicate function definitions");
+  List.iter (fun name -> if List.mem_assoc name tc.globals then raise (TypeError ("Function " ^ name ^ " redefines global"))) func_names;
   let typ_of_fdecl (f:fdecl) : (id*ty)=
     let arg_types = List.map fst f.args in
     (f.fname,TRef (RFun (arg_types,f.frtyp))) in
@@ -463,9 +488,13 @@ let create_global_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
  let vdecls = List.map (fun x -> match x with
     | Gvdecl n -> n.elt
     | _ -> failwith "unwrap: not a global variable declaration") @@ List.filter is_vdecl p in
-  let typ_of_gdecl (g:gdecl) : (id*ty) =
-    (g.name, typecheck_exp tc g.init) in
-  add_globals tc (List.map typ_of_gdecl vdecls)
+ let vdecl_names = List.map (fun x -> x.name) vdecls in
+ if has_duplicates vdecl_names then raise (TypeError "Duplicate global variable definitions");
+ List.iter (fun name -> if List.mem_assoc name tc.globals then raise (TypeError ("Global " ^ name ^ " redefines existing global"))) vdecl_names;
+ let fold_function acc (x:gdecl)=
+   try add_global acc x.name (typecheck_exp tc x.init) with _ ->
+     type_error x.init ("Error in global variable initializer for " ^ x.name) in
+  List.fold_left fold_function tc vdecls
 
 
 (* This function implements the |- prog and the H ; G |- prog

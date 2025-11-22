@@ -196,7 +196,14 @@ let oat_alloc_array ct (t:Ast.ty) (size:Ll.operand) : Ll.ty * operand * stream =
    - make sure to calculate the correct amount of space to allocate!
 *)
 let oat_alloc_struct ct (id:Ast.id) : Ll.ty * operand * stream =
-  failwith "TODO: oat_alloc_struct"
+  let fields = TypeCtxt.lookup id ct in
+  let size = List.length fields * 8 in
+  let ans_id, mem_id = gensym "struct", gensym "raw_struct" in
+  let ans_ty = Namedt id in
+  let mem_ty = Ptr I64 in
+  Ptr ans_ty, Id ans_id, lift
+    [ mem_id, Call(mem_ty, Gid "oat_malloc", [I64, Const (Int64.of_int size)])
+    ; ans_id, Bitcast(mem_ty, Id mem_id, Ptr ans_ty) ]
 
 
 let str_arr_ty s = Array(1 + String.length s, I8)
@@ -276,7 +283,13 @@ let rec cmp_exp (tc : TypeCtxt.t) (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.ope
        of the array struct representation.
   *)
   | Ast.Length e ->
-    failwith "todo:implement Ast.Length case"
+    let arr_ty, arr_op, arr_code = cmp_exp tc c e in
+    let ans_id = gensym "len" in
+    let ptr_id = gensym "len_ptr" in
+    I64, Id ans_id, 
+    arr_code >@ lift
+    [ ptr_id, Gep(arr_ty, arr_op, [Const 0L; Const 0L])
+    ; ans_id, Load(Ptr I64, Id ptr_id) ]
 
   | Ast.Index (e, i) ->
     let ans_ty, ptr_op, code = cmp_exp_lhs tc c exp in
@@ -313,16 +326,60 @@ let rec cmp_exp (tc : TypeCtxt.t) (c:Ctxt.t) (exp:Ast.exp node) : Ll.ty * Ll.ope
   | Ast.NewArr (elt_ty, e1, id, e2) ->    
     let _, size_op, size_code = cmp_exp tc c e1 in
     let arr_ty, arr_op, alloc_code = oat_alloc_array tc elt_ty size_op in
-    arr_ty, arr_op, size_code >@ alloc_code
+    
+    let i_ptr_id = gensym id in
+    let i_ty = I64 in
+    let c' = Ctxt.add c id (Ptr i_ty, Id i_ptr_id) in
+    
+    let lcond, lbody, lpost = gensym "cond", gensym "body", gensym "post" in
+    let i_val_id = gensym "i" in
+    let cmp_id = gensym "cmp" in
+    
+    let elt_ll_ty = cmp_ty tc elt_ty in
+    let e2_op, e2_code = cmp_exp_as tc c' e2 elt_ll_ty in
+    let elt_ptr_id = gensym "elt_ptr" in
+    let next_i_id = gensym "next_i" in
 
-   (* STRUCT TASK: complete this code that compiles struct expressions.
+    arr_ty, arr_op, 
+    size_code >@ alloc_code 
+    >:: E(i_ptr_id, Alloca i_ty)
+    >:: I("", Store(i_ty, Const 0L, Id i_ptr_id))
+    >:: T(Br lcond)
+    >:: L lcond
+    >:: I(i_val_id, Load(Ptr i_ty, Id i_ptr_id))
+    >:: I(cmp_id, Icmp(Slt, I64, Id i_val_id, size_op))
+    >:: T(Cbr(Id cmp_id, lbody, lpost))
+    >:: L lbody
+    >@ e2_code 
+    >:: I(elt_ptr_id, Gep(arr_ty, arr_op, [Const 0L; Const 1L; Id i_val_id]))
+    >:: I("", Store(elt_ll_ty, e2_op, Id elt_ptr_id))
+    >:: I(next_i_id, Binop(Add, I64, Id i_val_id, Const 1L))
+    >:: I("", Store(i_ty, Id next_i_id, Id i_ptr_id))
+    >:: T(Br lcond)
+    >:: L lpost
+
+  (* STRUCT TASK: complete this code that compiles struct expressions.
       For each field component of the struct
        - use the TypeCtxt operations to compute getelementptr indices
        - compile the initializer expression
        - store the resulting value into the structure
    *)
   | Ast.CStruct (id, l) ->
-    failwith "TODO: Ast.CStruct"
+    let struct_ty, struct_op, alloc_code = oat_alloc_struct tc id in
+    let rec compile_fields l stream =
+       match l with
+       | [] -> stream
+       | (fname, e)::rest ->
+          let field_ty, index = TypeCtxt.lookup_field_name id fname tc in
+          let ll_field_ty = cmp_ty tc field_ty in
+          let val_op, val_code = cmp_exp_as tc c e ll_field_ty in
+          let field_ptr = gensym "field" in
+          let stream = stream >@ val_code >@ lift
+             [ field_ptr, Gep(struct_ty, struct_op, [Const 0L; Const index])
+             ; "", Store(ll_field_ty, val_op, Id field_ptr) ] in
+          compile_fields rest stream
+    in
+    struct_ty, struct_op, alloc_code >@ compile_fields l []
 
   | Ast.Proj (e, id) ->
     let ans_ty, ptr_op, code = cmp_exp_lhs tc c exp in
@@ -344,7 +401,18 @@ and cmp_exp_lhs (tc : TypeCtxt.t) (c:Ctxt.t) (e:exp node) : Ll.ty * Ll.operand *
      You will find the TypeCtxt.lookup_field_name function helpful.
   *)
   | Ast.Proj (e, i) ->
-    failwith "todo: Ast.Proj case of cmp_exp_lhs"
+    let struct_ty, struct_op, struct_code = cmp_exp tc c e in
+    let id = match struct_ty with
+       | Ptr (Namedt id) -> id
+       | _ -> failwith "Proj: not a struct" in
+    let field_ty, index = TypeCtxt.lookup_field_name id i tc in
+    let ans_ty = cmp_ty tc field_ty in
+    let field_ptr = gensym "field_ptr" in
+    let cast_id = gensym "cast" in
+    ans_ty, Id field_ptr, struct_code 
+      >:: I(cast_id, Bitcast(struct_ty, struct_op, Ptr I8))
+      >:: I("", Call(Void, Gid "oat_assert_not_null", [Ptr I8, Id cast_id]))
+      >:: I(field_ptr, Gep(struct_ty, struct_op, [Const 0L; Const index]))
 
 
   (* ARRAY TASK: Modify this index code to call 'oat_assert_array_length' before doing the 
@@ -360,8 +428,12 @@ and cmp_exp_lhs (tc : TypeCtxt.t) (c:Ctxt.t) (e:exp node) : Ll.ty * Ll.operand *
       | Ptr (Struct [_; Array (_,t)]) -> t 
       | _ -> failwith "Index: indexed into non pointer" in
     let ptr_id, tmp_id = gensym "index_ptr", gensym "tmp" in
+    let cast_id = gensym "cast" in
     ans_ty, (Id ptr_id),
-    arr_code >@ ind_code >@ lift
+    arr_code >@ ind_code 
+    >:: I(cast_id, Bitcast(arr_ty, arr_op, Ptr I64))
+    >:: I("", Call(Void, Gid "oat_assert_array_length", [Ptr I64, Id cast_id; I64, ind_op]))
+    >@ lift
       [ptr_id, Gep(arr_ty, arr_op, [i64_op_of_int 0; i64_op_of_int 1; ind_op]) ]
 
    
@@ -435,7 +507,32 @@ and cmp_stmt (tc : TypeCtxt.t) (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt
          merge label after either block
   *)
   | Ast.Cast (typ, id, exp, notnull, null) ->
-    failwith "todo: implement Ast.Cast case"
+    let exp_ty, exp_op, exp_code = cmp_exp tc c exp in
+    let res_id = gensym id in
+    let target_ty = Ptr (cmp_rty tc typ) in 
+    
+    let null_cond = gensym "null_cond" in
+    let lnotnull, lnull, lpost = gensym "notnull", gensym "null", gensym "post" in
+    
+    let c_notnull = Ctxt.add c id (Ptr target_ty, Id res_id) in 
+    let cast_temp = gensym "cast_temp" in
+    
+    c, exp_code 
+       >:: I(null_cond, Icmp(Eq, exp_ty, exp_op, Null))
+       >:: T(Cbr(Id null_cond, lnull, lnotnull))
+       
+       >:: L lnotnull
+       >:: E(res_id, Alloca target_ty) 
+       >:: I(cast_temp, Bitcast(exp_ty, exp_op, target_ty))
+       >:: I("", Store(target_ty, Id cast_temp, Id res_id))
+       >@ cmp_block tc c_notnull rt notnull
+       >:: T(Br lpost)
+       
+       >:: L lnull
+       >@ cmp_block tc c rt null
+       >:: T(Br lpost)
+       
+       >:: L lpost
 
   | Ast.While (guard, body) ->
      let guard_ty, guard_op, guard_code = cmp_exp tc c guard in
@@ -594,7 +691,24 @@ let rec cmp_gexp c (tc : TypeCtxt.t) (e:Ast.exp node) : Ll.gdecl * (Ll.gid * Ll.
 
   (* STRUCT TASK: Complete this code that generates the global initializers for a struct value. *)  
   | CStruct (id, cs) ->
-    failwith "todo: Cstruct case of cmp_gexp"
+    let fields = TypeCtxt.lookup id tc in
+    let sorted_inits = List.map (fun f ->
+       let rec find_init l = match l with
+          | [] -> failwith "missing field in global struct init"
+          | (n, e)::t -> if n = f.fieldName then e else find_init t
+       in
+       find_init cs
+    ) fields in
+    let ll_struct_ty = Namedt id in
+    let elts, gs = List.fold_right (fun e (elts, gs) ->
+       let (ty, gd), gs' = cmp_gexp c tc e in
+       (ty, gd)::elts, gs' @ gs
+    ) sorted_inits ([], []) in
+    let gid = gensym "global_struct" in
+    let struct_lit_ty = Struct (List.map fst elts) in
+    let struct_init = GStruct elts in
+    let cast = GBitcast (Ptr struct_lit_ty, GGid gid, Ptr ll_struct_ty) in
+    (Ptr ll_struct_ty, cast), (gid, (struct_lit_ty, struct_init))::gs
 
   | _ -> failwith "bad global initializer"
 
