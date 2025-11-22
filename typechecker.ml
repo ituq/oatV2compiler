@@ -11,7 +11,7 @@ let type_error (l : 'a node) err =
   let (_, (s, e), _) = l.loc in
   raise (TypeError (Printf.sprintf "[%d, %d] %s" s e err))
 
-let und (l: 'a list) : bool = not @@ List.mem false l
+let all_true (l : bool list) : bool = List.for_all (fun x -> x) l
 
 
 (* initial context: G0 ------------------------------------------------------ *)
@@ -154,20 +154,16 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty = match e.elt wi
   | Id name when List.mem name (List.map fst c.locals) -> lookup_local name c
   | Id name -> (try lookup_global name c with Not_found -> type_error e ("no type is known for identifier " ^ name))
   | CArr (arr_ty,init_list) ->
-    let all_initializers_match_type =und @@ List.map (fun x -> subtype c (typecheck_exp c x) arr_ty) init_list in
+    let all_initializers_match_type =all_true @@ List.map (fun x -> subtype c (typecheck_exp c x) arr_ty) init_list in
     if typecheck_ty e c arr_ty;all_initializers_match_type then TRef (RArray arr_ty) else type_error e ("Mismatch in initalizers for array")
   | NewArr (arr_ty,size_node,x, exp_2) ->
-    let arr_type_valid = (typecheck_ty e c arr_ty=()) in
-    let arr_size_is_int = (typecheck_exp c size_node = TInt) in
-    let x_is_free = match lookup_local_option x c with
-      | None -> true
-      | Some _ -> false in
+    typecheck_ty e c arr_ty;
+    if typecheck_exp c size_node <> TInt then type_error e "Array size must be an integer";
+    if lookup_local_option x c <> None then type_error e ("Identifier " ^ x ^ " already bound in local context");
     let expanded_context = add_local c x TInt in
     let exp2_type = typecheck_exp expanded_context exp_2 in
-    let exp2_type_is_subtype = subtype c exp2_type arr_ty in
-    if arr_type_valid && arr_size_is_int && x_is_free && exp2_type_is_subtype
-    then TRef (RArray arr_ty)
-    else type_error e ("Ill-typed lambda array creation")
+    if not (subtype c exp2_type arr_ty) then type_error e "Array initializer type mismatch";
+    TRef (RArray arr_ty)
   | Index (array, index) ->
   let type_of_array = match typecheck_exp c array with
     | TRef (RArray t) -> t
@@ -189,7 +185,7 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty = match e.elt wi
   let struct_fields = List.map (fun (name, exp) -> (name, typecheck_exp c exp)) assignment_list in
   let sorted_struct_fields = List.sort (fun (name1, _) (name2, _) -> String.compare name1 name2) struct_fields in
   let is_subtype_list = List.map2 (fun actual expected -> subtype c (snd actual) (snd expected)) sorted_struct_fields sorted_expected_struct_fields in
-  if und is_subtype_list then TRef (RStruct struct_typename) else type_error e ("Struct field types do not match")
+  if all_true is_subtype_list then TRef (RStruct struct_typename) else type_error e ("Struct field types do not match")
   | Proj (struct_exp, field_name) ->
   let struct_type = match typecheck_exp c struct_exp with
     | TRef (RStruct s) -> s
@@ -200,23 +196,21 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty = match e.elt wi
     | Some t -> t
   end
   | Call (fn_exp, arg_exps) ->
-  let fn_name =begin match fn_exp.elt with
-    | Id name -> name
-    | _ -> type_error e ("Function call on non-identifier")
-  end in
-  let fn_type = try lookup fn_name c with Not_found -> type_error e ("No type known for function " ^ fn_name) in
-  let arg_types = List.map (typecheck_exp c) arg_exps in
-  begin match fn_type with
+    let fn_type = typecheck_exp c fn_exp in
+    let arg_types = List.map (typecheck_exp c) arg_exps in
+    begin match fn_type with
     | TRef (RFun (param_types, ret_ty)) | TNullRef (RFun (param_types, ret_ty)) ->
-    begin match ret_ty with
-      | RetVoid -> type_error e ("Function " ^ fn_name ^ " has void return type, cannot be used in expression")
+      if List.length arg_types <> List.length param_types then
+        type_error e "Argument count mismatch";
+      begin match ret_ty with
+      | RetVoid -> type_error e ("Function has void return type, cannot be used in expression")
       | RetVal ret_type ->
-        if und @@ List.map2 (subtype c) arg_types param_types
+        if all_true @@ List.map2 (subtype c) arg_types param_types
         then ret_type
-        else type_error e ("Argument types do not match for function " ^ fn_name)
+        else type_error e ("Argument types do not match for function call")
+      end
+    | _ -> type_error e ("Function call on non-function type")
     end
-    | _ -> type_error e ("Function call on non-function type for " ^ fn_name)
-  end
   | Bop (Eq, a, b) | Bop (Neq, a,b) ->
     let a_type,b_type = typecheck_exp c a, typecheck_exp c b in
     if subtype c a_type b_type && subtype c b_type a_type then TBool else type_error e ("Equality operator type mismatch")
@@ -263,8 +257,120 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty = match e.elt wi
    - You will probably find it convenient to add a helper function that implements the
      block typecheck rules.
 *)
-let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.t * bool =
-  failwith "todo: implement typecheck_stmt"
+
+let has_duplicates lst =
+  let rec aux = function
+    | [] -> false
+    | x :: xs -> List.mem x xs || aux xs
+  in
+  aux lst
+
+let flip (p:'a * 'b) = let (x,y) = p in (y,x)
+
+(* Helper function to check if a block returns without throwing an error *)
+let rec block_returns (tc : Tctxt.t) (b : Ast.block) (to_ret : Ast.ret_ty) : bool =
+  let fold_function (acc: Tctxt.t * bool) (n:stmt node) =
+    let new_ctxt,returns = typecheck_stmt (fst acc) n to_ret in
+    (new_ctxt, (snd acc) || returns) in
+  snd @@ List.fold_left fold_function (tc, false) b
+
+and typecheck_block (tc : Tctxt.t) (b : Ast.block) (to_ret : Ast.ret_ty) : unit =
+  let fold_function (acc: Tctxt.t * bool) (n:stmt node) =
+    let new_ctxt,returns = typecheck_stmt (fst acc) n to_ret in
+    (new_ctxt, (snd acc) || returns) in
+  if snd @@ List.fold_left fold_function (tc, false) b then ()
+  else type_error (List.hd b) "Function body does not definitely return"
+and  typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.t * bool = match s.elt with
+  | Decl (id ,exp_node) -> let exp_ty = typecheck_exp tc exp_node in
+    begin match lookup_local_option id tc with
+      | Some _ -> type_error s ("Identifier " ^ id ^ " already bound in local context")
+      | None -> (add_local tc id exp_ty, false)
+    end
+  | Assn (lhs, rhs) ->
+    begin
+      let t,t' = typecheck_exp tc lhs, typecheck_exp tc rhs in
+      let t_is_not_global_fun_id = match lhs.elt with
+        | Id name -> (try
+            let g_ty = lookup_global name tc in
+            match g_ty with
+            | TRef (RFun _) -> false
+            | TNullRef (RFun _) -> false
+            | _ -> true
+          with Not_found -> true)
+        | _ -> true in
+      let is_subtype = subtype tc t' t in
+      let condition= List.mem t (List.map snd tc.locals) || t_is_not_global_fun_id in
+      if condition && is_subtype then (tc, false)
+      else type_error s ("Assignment type mismatch or assignment to global function identifier")
+    end
+  | SCall (fn, args) ->
+    begin
+      let fn_type = typecheck_exp tc fn in
+      let arg_types = List.map (typecheck_exp tc) args in
+      begin match fn_type with
+        | TRef (RFun (param_types, ret_ty)) | TNullRef (RFun (param_types, ret_ty)) ->
+          if ret_ty <> RetVoid then
+            type_error s ("Function with non-void return type used in statement call") else ();
+          if List.length arg_types <> List.length param_types then
+            type_error s "Argument count mismatch in statement call" else ();
+          if all_true @@ List.map2 (subtype tc) arg_types param_types then
+            (tc, false)
+          else
+            type_error s "Argument types do not match for statement call"
+        | _ -> type_error s "Function call on non-function type in statement call"
+      end
+    end
+  | If (cond, yes, no) ->
+    begin
+      if typecheck_exp tc cond <> TBool then
+        type_error s "Condition expression not boolean in if statement";
+      let yes_returns = block_returns tc yes to_ret in
+      let no_returns = block_returns tc no to_ret in
+      let both_return = yes_returns && no_returns in
+      (tc, both_return)
+    end
+  | Cast (ref,x,expr, yes, no) ->
+    begin
+      let exp_ty = typecheck_exp tc expr in
+      begin match exp_ty with
+        | TNullRef ref' ->
+          if not @@ subtype_ref tc ref' ref then
+            type_error s "Cast type mismatch";
+          let expanded_context = add_local tc x (TRef ref) in
+          let yes_returns = block_returns expanded_context yes to_ret in
+          let no_returns = block_returns tc no to_ret in
+          let both_return = yes_returns && no_returns in
+          (tc, both_return)
+        | _ -> type_error s "Cast expression must be a possbly-null reference type"
+      end
+    end
+  | While (cond, block) ->
+    if typecheck_exp tc cond <> TBool then
+      type_error s "Condition expression not boolean in while statement"
+    else
+      typecheck_block tc block to_ret;
+      (tc, false)
+  |For (vdecls,Some cond,Some stmt, block) ->
+  let vdecls_stmts = List.map (fun vd -> {elt=Decl vd; loc=s.loc}) vdecls in
+  let fold_function = fun (context:Tctxt.t) (n:stmt node) ->
+    let new_ctxt,_ = typecheck_stmt context n to_ret in
+    new_ctxt in
+  let expanded_context = List.fold_left fold_function tc vdecls_stmts in
+  if typecheck_exp expanded_context cond <> TBool then
+    type_error s "Condition expression not boolean in for statement"
+  else
+    let _,_ = typecheck_stmt expanded_context stmt to_ret in
+    typecheck_block expanded_context block to_ret;
+    (tc, false)
+  | Ret None -> (tc,true)
+  | Ret (Some expr) ->
+  let return_ty= match to_ret with
+    | RetVoid -> type_error s "Return type mismatch: expected void"
+    | RetVal t -> t in
+  let exp_ty = typecheck_exp tc expr in
+  if subtype tc exp_ty return_ty then (tc,true) else type_error s "Return type mismatch"
+  | _ -> failwith "todo: implement remaining statement cases"
+
 
 
 (* struct type declarations ------------------------------------------------- *)
@@ -291,7 +397,9 @@ let typecheck_tdecl (tc : Tctxt.t) id fs  (l : 'a Ast.node) : unit =
     - checks that the function actually returns
 *)
 let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
-  failwith "todo: typecheck_fdecl"
+  let expanded_context = add_locals tc (List.map flip f.args) in
+  if has_duplicates @@ List.map snd f.args then raise (TypeError ("Duplicate parameter names in function " ^ f.fname)) else
+  typecheck_block expanded_context f.body f.frtyp
 
 (* creating the typchecking context ----------------------------------------- *)
 

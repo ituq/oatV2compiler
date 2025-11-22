@@ -19,6 +19,8 @@ let empty = { locals = []; globals = []; structs = [] }
 
 (* locals ------------------------------------------------------------------- *)
 let add_local (c:t) (id:id) (bnd : Ast.ty) : t = {c with locals = (id, bnd)::c.locals}
+let add_locals (c:t) (lst:(Ast.id * Ast.ty) list) : t =
+  {c with locals = lst @ c.locals}
 let lookup_local (id : Ast.id) (c : t) : Ast.ty = List.assoc id c.locals
 let lookup_local_option id c : Ast.ty option =
   try Some (List.assoc id c.locals) with Not_found -> None
